@@ -38,7 +38,7 @@
 #  Env : OPENSSL_BIN=/path/to/openssl  (default: openssl on PATH; 3.5+ needed for ML-KEM tests)
 # =============================================================================================
 
-VERSION="2.0"
+VERSION="2.2"
 LISTS=(); BASE="."; PORTSPEC="--top-ports 1000"; JOBS=4; TESTSSL=0; UDP=1; TMO=8; ALLURL=0
 usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 while getopts "i:o:p:j:tnT:Ah" opt; do
@@ -53,6 +53,7 @@ mkdir -p "$BASE" && BASE="$(cd "$BASE" && pwd)" || exit 1
 
 OSSL="${OPENSSL_BIN:-openssl}"
 TMPD="$(mktemp -d)"; trap 'rm -rf "$TMPD"' EXIT
+trap 'echo; echo "[!] interrupted - stopping all scans" >&2; kill $(jobs -p) 2>/dev/null; pkill -P $$ 2>/dev/null; exit 130' INT TERM
 : > "$TMPD/openssl.cnf"
 export OPENSSL_CONF="$TMPD/openssl.cnf"          # OS openssl.cnf must not hide legacy protocols
 LOG="$TMPD/start.log"
@@ -67,6 +68,7 @@ if [ $ROOT -eq 1 ]; then NMAPSCAN="-sS -O --osscan-limit"; else NMAPSCAN="-sT"; 
 SSHAUDIT=""; have ssh-audit && SSHAUDIT="ssh-audit"
 TESTSSLBIN=""; have testssl && TESTSSLBIN="testssl"; have testssl.sh && TESTSSLBIN="testssl.sh"
 IKESCAN=""; have ike-scan && IKESCAN="ike-scan"
+KEYSCAN=""; have ssh-keyscan && have ssh-keygen && KEYSCAN="ssh-keyscan"
 LEGACY=""; "$OSSL" s_client -help 2>&1 | grep -q -- '-legacy_server_connect' && LEGACY="-legacy_server_connect"
 SSL3=0; "$OSSL" s_client -help 2>&1 | grep -qE '^ *-ssl3 ' && SSL3=1
 OSSLVER="$("$OSSL" version 2>&1)"
@@ -112,7 +114,7 @@ rdp_neg() {
   timeout 6 bash -c "exec 3<>/dev/tcp/$1/$2 && printf '\\x03\\x00\\x00\\x13\\x0e\\xe0\\x00\\x00\\x00\\x00\\x00\\x01\\x00\\x08\\x00\\x$3\\x00\\x00\\x00' >&3 && head -c 19 <&3" 2>/dev/null | od -An -tx1 | tr -s ' \n' ' ' | sed 's/^ //; s/ $//'
 }
 rdp_meaning() {   # <hex response>
-  local b=($1)
+  local b; read -r -a b <<<"$1"
   if [ ${#b[@]} -lt 11 ]; then echo "no response"; return; fi
   if [ ${#b[@]} -lt 19 ]; then echo "no negotiation data (legacy server - Standard RDP Security only)"; return; fi
   if [ "${b[11]}" = "02" ]; then
@@ -123,6 +125,35 @@ rdp_meaning() {   # <hex response>
     case "${b[15]}" in 01) echo "refused: SSL/TLS required by server" ;; 02) echo "refused: SSL not allowed by server" ;;
       05) echo "refused: NLA (CredSSP) required by server" ;; 06) echo "refused: SSL with user auth required" ;; *) echo "refused: code 0x${b[15]}" ;; esac
   else echo "unexpected response"; fi
+}
+
+# ssh_kexinit <ip> <port>  -> server identification + the 10 algorithm name-lists of its SSH_MSG_KEXINIT
+# (RFC 4253 s7.1). One TCP connection: read the server banner + first packet, nothing else is negotiated.
+ssh_kexinit() {
+  timeout 10 bash -c "exec 3<>/dev/tcp/$1/$2 && printf 'SSH-2.0-PQC_Inventory_Scanner\r\n' >&3 && timeout 3 cat <&3" 2>/dev/null \
+  | od -An -v -tx1 | awk '
+    function h2d(x,  i, v) { v = 0; for (i = 1; i <= length(x); i++) v = v * 16 + index("0123456789abcdef", substr(x, i, 1)) - 1; return v }
+    { for (i = 1; i <= NF; i++) b[n++] = $i }
+    END {
+      s = -1
+      for (i = 0; i < n - 3; i++) if (b[i] == "53" && b[i+1] == "53" && b[i+2] == "48" && b[i+3] == "2d") { s = i; break }
+      if (s < 0) exit 1
+      p = -1; ban = ""
+      for (i = s; i < n; i++) { if (b[i] == "0a") { p = i + 1; break } if (b[i] != "0d") ban = ban sprintf("%c", h2d(b[i])) }
+      if (p < 0 || p + 22 > n) exit 1
+      plen = h2d(b[p] b[p+1] b[p+2] b[p+3])
+      if (b[p+5] != "14" || plen > 35000) exit 1
+      split("kex_algorithms server_host_key_algorithms encryption_algorithms_client_to_server encryption_algorithms_server_to_client mac_algorithms_client_to_server mac_algorithms_server_to_client compression_algorithms_client_to_server compression_algorithms_server_to_client languages_client_to_server languages_server_to_client", nm, " ")
+      print "server_identification: " ban
+      q = p + 6 + 16
+      for (k = 1; k <= 10; k++) {
+        if (q + 4 > n) exit 1
+        L = h2d(b[q] b[q+1] b[q+2] b[q+3]); q += 4; str = ""
+        if (q + L > n) exit 1
+        for (j = 0; j < L; j++) str = str sprintf("%c", h2d(b[q+j]))
+        q += L; print nm[k] ": " str
+      }
+    }'
 }
 
 starttls_for() {   # <port> <service>
@@ -247,7 +278,7 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
   awk '/^[0-9]+\/tcp +open /{split($1,a,"/"); s=$3; $1=$2=$3=""; sub(/^ +/,""); print a[1]"|"s"|"$0}' "$NM" > "$T/ports.txt"
 
   local n_enc=0 n_pq=0 n_nt=0 n_d=0 n_clear=0 p svc prod
-  while IFS='|' read -r p svc prod; do
+  while IFS='|' read -r p svc prod <&3; do
     [ -z "$p" ] && continue
     local blk; blk=$(nse_block "$p" "$NM")
     local base="${svc#ssl/}"; base="${base%\?}"; local st="" layer="" protos="" pqc="n/a" groups="" certtxt="" cls="" flags=() o
@@ -395,7 +426,8 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
       if [ -z "$ulist" ]; then if [ $tlsok -eq 1 ]; then ulist="https://$h:$p/"; else ulist="http://$h:$p/"; fi; fi
       for url in $ulist; do
         uh=$(sed -E 's|^https?://([^/:?#]+).*|\1|' <<<"$url")
-        hdr=$(curl -sk --noproxy '*' -L --max-redirs 5 -o /dev/null -D - --max-time "$TMO" $(is_ipv4 "$uh" || echo "--resolve $uh:$p:$ip") "$url" 2>&1 | tr -d '\r')
+        local ra=(); is_ipv4 "$uh" || ra=(--resolve "$uh:$p:$ip")
+        hdr=$(curl -sk --noproxy '*' -L --max-redirs 5 -o /dev/null -D - --max-time "$TMO" "${ra[@]}" "$url" 2>&1 | tr -d '\r')
         { echo "--- HTTP response headers (redirects followed) ---"; echo "\$ curl -sk -L -D - $url"; echo "${hdr:-(no response)}" | head -60; echo; } >> "$HB"
         allhdr="$allhdr"$'\n'"$hdr"
       done
@@ -408,27 +440,68 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
       fi
     fi
 
-    # ---- SSH --------------------------------------------------------------------------------
+    # ---- SSH ----------------------------------------------------------------------------------
     if [[ "$base" == ssh ]] || grep -q 'ssh2-enum-algos' <<<"$blk"; then
       layer="SSH"; n_enc=$((n_enc + 1)); protos="SSH-2"
-      local kex; kex=$(awk '/kex_algorithms:/{f=1;next} /server_host_key_algorithms:/{f=0} f' <<<"$blk" | sed 's/^|[ _]*//' | grep -v '^$')
-      local allalg; allalg=$(sed 's/^|[ _]*//' <<<"$blk")
-      groups=$(grep -vE 'ext-info|kex-strict' <<<"$kex" | paste -sd, - | sed 's/,/, /g')
-      if grep -qE 'mlkem|sntrup' <<<"$kex"; then pqc="YES ($(grep -E 'mlkem|sntrup' <<<"$kex" | paste -sd, - | sed 's/,/, /g'))"; n_pq=$((n_pq + 1))
-        flags+=("[Info] SSH offers post-quantum hybrid key exchange")
-      else pqc="NO"; flags+=("[PQC] SSH key exchange quantum-vulnerable - no mlkem768x25519 / sntrup761x25519"); fi
-      local sw; sw=$(grep -xE 'diffie-hellman-group1-sha1|diffie-hellman-group14-sha1|diffie-hellman-group-exchange-sha1|ssh-rsa|ssh-dss|.*-cbc.*|3des.*|arcfour.*|blowfish.*|cast128.*|hmac-md5.*|hmac-sha1.*|umac-64.*' <<<"$allalg" | sort -u | paste -sd' ' -)
-      [ -n "$sw" ] && flags+=("[Medium] Weak SSH algorithms offered: $sw")
-      if ! grep -q 'kex-strict-s' <<<"$allalg" && grep -qE 'chacha20-poly1305|etm@openssh.com' <<<"$allalg"; then
-        flags+=("[Medium] Terrapin (CVE-2023-48795) exposure - strict KEX not advertised"); fi
-      local hk; hk=$(grep -oE '^\|[ _]+[0-9]+ [A-Za-z0-9:+/=]+ \([A-Z0-9-]+\)' <<<"$blk" | sed 's/^|[ _]*//' | awk '{print $3" "$1}' | tr -d '()' | paste -sd, - | sed 's/,/, /g')
-      certtxt="host keys: ${hk:-see nmap output}"
-      grep -qE 'RSA (512|768|1024)' <<<"$hk" && flags+=("[High] Weak SSH RSA host key (<2048)")
-      [ -n "$hk" ] && flags+=("[PQC] Quantum-vulnerable SSH host key(s): $hk")
-      { echo "--- SSH algorithms offered by the server: nmap ssh2-enum-algos / ssh-hostkey output at the top of this file ---"
-        echo "    Key exchange : ${groups:--}"; echo "    Host keys    : ${hk:-see nmap output}"; } >> "$PB"
+      # algorithm lists: read the server's KEXINIT ourselves (works with every SSH version), nmap as fallback
+      local kx="" try kex allalg src
+      for try in 1 2 3 4; do kx=$(ssh_kexinit "$ip" "$p"); [ -n "$kx" ] && break; [ $try -lt 4 ] && sleep $((try * 5)); done
+      # host keys and sizes: ssh-keyscan (speaks every modern key exchange), nmap ssh-hostkey as fallback
+      local hk="" ksout="" kfp=""
+      if [ -n "$KEYSCAN" ]; then
+        for try in 1 2 3; do
+          ksout=$(timeout 30 ssh-keyscan -T 8 -p "$p" -t rsa,ecdsa,ed25519 "$ip" 2>/dev/null </dev/null)
+          [ "$(grep -vc '^#' <<<"$ksout")" -ge 1 ] && [ -n "$ksout" ] && break; [ $try -lt 3 ] && sleep $((try * 5))
+        done
+        kfp=$(ssh-keygen -lf - <<<"$ksout" 2>/dev/null)
+        hk=$(awk 'NF>=3{t=$NF; gsub(/[()]/,"",t); print t" "$1}' <<<"$kfp" | paste -sd, - | sed 's/,/, /g')
+      fi
+      local sa_out=""
+      [ -n "$SSHAUDIT" ] && sa_out=$(timeout 60 "$SSHAUDIT" -n -p "$p" "$ip" </dev/null 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+      if [ -n "$kx" ]; then
+        src="scanner KEXINIT read"
+        kex=$(grep '^kex_algorithms:' <<<"$kx" | sed 's/^[^:]*: //' | tr ',' '\n')
+        allalg=$(grep -vE '^(server_identification|languages)' <<<"$kx" | sed 's/^[^:]*: //' | tr ',' '\n' | grep -v '^$' | sort -u)
+        protos="SSH-2 ($(grep '^server_identification:' <<<"$kx" | sed 's/^[^:]*: //; s/^SSH-2.0-//'))"
+      elif grep -qE '^\(kex\) ' <<<"$sa_out"; then
+        src="ssh-audit"
+        kex=$(grep -oE '^\(kex\) [^ ]+' <<<"$sa_out" | awk '{print $2}')
+        allalg=$(grep -oE '^\((kex|key|enc|mac)\) [^ ]+' <<<"$sa_out" | awk '{print $2}' | sort -u)
+      else
+        src="nmap ssh2-enum-algos"
+        kex=$(awk '/kex_algorithms:/{f=1;next} /server_host_key_algorithms:/{f=0} f' <<<"$blk" | sed 's/^|[ _]*//' | grep -v '^$')
+        allalg=$(sed 's/^|[ _]*//' <<<"$blk")
+      fi
+      { echo "--- 1. SSH algorithms offered by the server (source: $src) ---"
+        echo "\$ (connect $ip:$p, send identification string, read SSH_MSG_KEXINIT - RFC 4253 s7.1; no key exchange, no login)"
+        echo "${kx:-    (scanner could not read KEXINIT after 4 attempts - algorithms taken from $src)}"; } >> "$PB"
+      groups=$(grep -vE 'ext-info|kex-strict|^$' <<<"$kex" | paste -sd, - | sed 's/,/, /g')
+      if [ -z "$groups" ]; then
+        pqc="UNKNOWN (no SSH algorithm data received)"; n_nt=$((n_nt + 1))
+        flags+=("[Info] SSH algorithm list could not be read - the server may be rate-limiting connections (sshd MaxStartups); re-run this host")
+      else
+        if grep -qE 'mlkem|sntrup' <<<"$kex"; then pqc="YES ($(grep -E 'mlkem|sntrup' <<<"$kex" | paste -sd, - | sed 's/,/, /g'))"; n_pq=$((n_pq + 1))
+          flags+=("[Info] SSH offers post-quantum hybrid key exchange")
+        else pqc="NO"; flags+=("[PQC] SSH key exchange quantum-vulnerable - no mlkem768x25519 / sntrup761x25519"); fi
+        local sw sl
+        sw=$(grep -xE 'diffie-hellman-group1-sha1|diffie-hellman-group14-sha1|diffie-hellman-group-exchange-sha1|ssh-rsa|ssh-dss|.*-cbc(@.*)?|3des.*|arcfour.*|blowfish.*|cast128.*|hmac-md5.*|rijndael-cbc.*' <<<"$allalg" | sort -u | paste -sd' ' -)
+        sl=$(grep -xE 'hmac-sha1.*|umac-64.*' <<<"$allalg" | sort -u | paste -sd' ' -)
+        [ -n "$sw" ] && flags+=("[Medium] Weak SSH algorithms offered: $sw")
+        [ -n "$sl" ] && flags+=("[Low] Legacy SSH MACs offered (SHA-1 / 64-bit tag): $sl")
+        if ! grep -q 'kex-strict-s' <<<"$allalg" && grep -qE 'chacha20-poly1305|etm@openssh.com' <<<"$allalg"; then
+          flags+=("[Medium] Terrapin (CVE-2023-48795) exposure - strict KEX not advertised"); fi
+      fi
+      [ -z "$hk" ] && hk=$(grep -oE '^\|[ _]+[0-9]+ [A-Za-z0-9:+/=]+ \([A-Z0-9-]+\)' <<<"$blk" | sed 's/^|[ _]*//' | awk '{print $3" "$1}' | tr -d '()' | paste -sd, - | sed 's/,/, /g')
+      { echo; echo "--- 2. SSH host keys ---"
+        echo "\$ ssh-keyscan -T 8 -p $p -t rsa,ecdsa,ed25519 $ip | ssh-keygen -lf -"
+        echo "${kfp:-    (ssh-keyscan not available or no answer - nmap ssh-hostkey used if it had data)}"
+        echo "    Host keys: ${hk:-not determined}"; } >> "$PB"
+      certtxt="host keys: ${hk:-not determined}"
+      grep -qE 'RSA (512|768|1024)( |,|$)' <<<"$hk" && flags+=("[High] Weak SSH RSA host key (<2048)")
+      if [ -n "$hk" ]; then flags+=("[PQC] Quantum-vulnerable SSH host key(s): $hk")
+      else flags+=("[PQC] SSH host keys could not be read - treat as classical (RSA / ECDSA / Ed25519) unless the owner confirms otherwise"); fi
       if [ -n "$SSHAUDIT" ]; then
-        { echo; echo "--- ssh-audit ---"; echo "\$ $SSHAUDIT -n -p $p $ip"; timeout 60 $SSHAUDIT -n -p "$p" "$ip" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; } >> "$PB"
+        { echo; echo "--- 3. ssh-audit ---"; echo "\$ $SSHAUDIT -n -p $p $ip"; echo "$sa_out"; } >> "$PB"
       fi
     fi
 
@@ -483,9 +556,9 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
 
     # ---- optional testssl.sh --------------------------------------------------------------------
     if [ $TESTSSL -eq 1 ] && [ -n "$TESTSSLBIN" ] && { [ $tlsok -eq 1 ] || [ $wrapped -eq 1 ]; }; then
-      local tt="$ip:$p"; [ "$sni" != "-" ] && tt="$sni:$p"
-      { echo "\$ $TESTSSLBIN --quiet --color 0 --warnings off -p -s -f -P -S $([ "$st" != "-" ] && echo "-t $st") --ip $ip $tt"
-        timeout 900 $TESTSSLBIN --quiet --color 0 --warnings off -p -s -f -P -S $([ "$st" != "-" ] && echo "-t $st") --ip "$ip" "$tt" 2>&1; } >> "$TS"
+      local tt="$ip:$p" ta=(); [ "$sni" != "-" ] && tt="$sni:$p"; [ "$st" != "-" ] && ta=(-t "$st")
+      { echo "\$ $TESTSSLBIN --quiet --color 0 --warnings off -p -s -f -P -S ${ta[*]} --ip $ip $tt"
+        timeout 900 "$TESTSSLBIN" --quiet --color 0 --warnings off -p -s -f -P -S "${ta[@]}" --ip "$ip" "$tt" </dev/null 2>&1; } >> "$TS"
     fi
 
     # ---- class ----------------------------------------------------------------------------------
@@ -531,7 +604,7 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
     } >> "$S"
     local q='"'; esc() { echo "$1" | tr '\n' ';' | sed "s/$q/'/g; s/;$//"; }
     echo "\"$key\",\"$ip\",\"$names\",\"$p\",\"$svc\",\"$(esc "$prod")\",\"$(esc "$layer")\",\"$(esc "$protos")\",\"$(esc "$pqc")\",\"$(esc "$groups")\",\"$(esc "$certtxt")\",\"$cls\",\"$(grep -c '^\[High\]' <<<"$fl")/$(grep -c '^\[Medium\]' <<<"$fl")\",\"$(esc "$(grep '^\[PQC\]' <<<"$fl")")\",\"$(esc "$(grep -E '^\[(High|Medium|Low)\]' <<<"$fl")")\",\"$fname/$pf\"" >> "$C"
-  done < "$T/ports.txt"
+  done 3< "$T/ports.txt"
 
   # ---- IKE / IPsec on UDP 500 -> 50_ike_udp500.txt -------------------------------------------------
   if [ $UDP -eq 1 ] && [ $ROOT -eq 1 ] && [ -n "$IKESCAN" ]; then
@@ -570,8 +643,8 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
   elif [ $n_enc -eq 0 ]; then ready="Not determined - no observable encryption"
   elif [ $n_pq -eq $n_enc ] && [ $n_d -eq $n_enc ]; then ready="QUANTUM-SAFE as observed - PQC key exchange and no quantum-vulnerable keys on all $n_enc encrypted services"
   elif [ $n_pq -eq $n_enc ]; then ready="PQC key exchange on ALL encrypted services ($n_pq/$n_enc) - some certificates/host keys still classical"
-  elif [ $n_pq -gt 0 ]; then ready="MIXED - PQC key exchange on $n_pq of $n_enc encrypted services"
-  elif [ $n_nt -gt 0 ]; then ready="NOT DETERMINED for $n_nt TLS service(s) - ML-KEM not tested (scanner openssl < 3.5); other $((n_enc - n_nt)) encrypted service(s) classical"
+  elif [ $n_pq -gt 0 ]; then ready="MIXED - PQC key exchange on $n_pq of $n_enc encrypted services$([ $n_nt -gt 0 ] && echo " ($n_nt not determined - see port files)")"
+  elif [ $n_nt -gt 0 ]; then ready="NOT DETERMINED for $n_nt service(s) - PQC key exchange could not be tested (see port files); other $((n_enc - n_nt)) encrypted service(s) classical"
   else ready="NOT quantum-safe - classical key exchange only on all $n_enc encrypted services"; fi
   rmdir "$D/certs" 2>/dev/null
   {
@@ -616,7 +689,7 @@ add_target() {
 }
 
 log "pqc_scan.sh $VERSION | lists: ${LISTS[*]} | parallel $JOBS | root=$ROOT | ports: $PORTSPEC | base folder: $BASE"
-log "openssl: $OSSLVER | PQC KEX testing: $PQCAP | ssh-audit: ${SSHAUDIT:-no} | testssl: ${TESTSSLBIN:-no} | ike-scan: ${IKESCAN:-no}"
+log "openssl: $OSSLVER | PQC KEX testing: $PQCAP | ssh-audit: ${SSHAUDIT:-no} | testssl: ${TESTSSLBIN:-no} | ike-scan: ${IKESCAN:-no} | ssh-keyscan: ${KEYSCAN:-no}"
 [ $ROOT -eq 0 ] && log "not root: TCP connect scan, no OS detection, no UDP/IKE check (run with sudo for those)"
 
 for LISTFILE in "${LISTS[@]}"; do
@@ -629,7 +702,7 @@ for LISTFILE in "${LISTS[@]}"; do
   KEYS=(); UNRES=()
   log "list $LISTFILE -> folder $LISTDIR"
 
-  while IFS= read -r line || [ -n "$line" ]; do
+  while IFS= read -r line <&4 || [ -n "$line" ]; do
     line="${line%%#*}"; line=$(printf '%s' "$line" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     [ -z "$line" ] && continue
     if [[ "$line" =~ ^(https?)://([^/:?#]+)(:([0-9]+))?([/?#].*)?$ ]]; then          # URL -> folder per website host
@@ -656,7 +729,7 @@ for LISTFILE in "${LISTS[@]}"; do
       rip=$(getent ahostsv4 "$host" | awk 'NR==1{print $1}')                               # hostname -> folder per IP
       if [ -n "$rip" ]; then add_target "$rip" "$rip" "$host" "$port" "$line" ""; else UNRES+=("$line"); log "not resolved: $line"; fi
     fi
-  done < "$LISTFILE"
+  done 4< "$LISTFILE"
 
   log "$LISTNAME: ${#KEYS[@]} targets (${#UNRES[@]} not resolved)"
   for key in "${KEYS[@]}"; do
