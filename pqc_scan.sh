@@ -16,7 +16,9 @@
 #    30_rdp_ / 31_smb_ / 32_vnc_<port>.txt   RDP security layer, SMB dialects, VNC security types
 #    40_other_<port>_<svc>.txt       cleartext / not observable / unknown services
 #    50_ike_udp500.txt               IKE / IPsec VPN proposals (root only)
-#  plus per list: 00_LIST_SUMMARY.txt, summary.csv, scan.log, MANIFEST_SHA256.txt
+#    51_udp_services.txt             UDP services (SNMP, IKE/IPsec, OpenVPN, NTP, RADIUS...) - root only
+#  plus per list: 00_LIST_SUMMARY.txt (with a RUN REPORT), summary.csv, scan.log, MANIFEST_SHA256.txt,
+#  unreachable.txt (hosts that were down/unreachable) and not_resolved.txt - both ready to re-run.
 #
 #  List file lines ('#' comments ok):
 #    10.10.1.5   app01.corp.local   10.10.2.0/24   10.10.1.9:8443          -> folder per IP
@@ -29,22 +31,40 @@
 #  Usage : ./pqc_scan.sh -i serverip.txt [-i switchip.txt -i applications.txt] [options]
 #    -i  list file (repeat -i for several lists)
 #    -o  base folder where the list folders are created   (default: current folder)
-#    -p  nmap port spec for IP entries, e.g. 1-65535 or 22,443   (default: top 1000 TCP ports)
+#    -p  nmap TCP port spec, e.g. 22,443 or 1-65535 or - for all   (default: top 1000; -p- = every port)
 #    -A  for URL entries, also scan all services of that host   (default: URL ports + 80 only)
-#    -j  targets scanned in parallel                      (default 4)
+#    -j  hosts scanned in parallel (each host is one nmap)  (default 4; raise for many robust hosts)
 #    -t  also run testssl.sh on every TLS port            (slower, very detailed)
-#    -n  skip the UDP 500 IKE/IPsec check
+#    -n  skip all UDP scanning (SNMP, IKE/IPsec, OpenVPN, NTP, RADIUS...)
+#    -F  fast: scan only ~48 common service ports (web/mail/dir/DB/mgmt/RDP/VNC) - best for
+#        rate-limiting firewalls that drop probes and make a wide scan take an hour
+#    -R  skip the reachability pre-check (scan every host, even one that looks down)
 #    -T  timeout per handshake in seconds                 (default 8)
 #  Env : OPENSSL_BIN=/path/to/openssl  (default: openssl on PATH; 3.5+ needed for ML-KEM tests)
+#  Reachability: a host answering neither ICMP nor ~200 common TCP ports (after retries) is marked
+#    UNREACHABLE and skipped to save time, and written to unreachable.txt. Slow / rate-limited hosts
+#    get a second, slower probe first so they are not wrongly called down. Tune with env
+#    REACH_T1 / REACH_T2 (probe host-timeouts), REACH_R1 / REACH_R2 (retries), NMAP_RETRIES, HOST_TIMEOUT.
+#  Ports: default top 1000 TCP (fast, covers common services). -p 22,443,1433,... for a targeted set,
+#    -p- for every port. A FILTERED port will not show whatever the range - it means the firewall/path
+#    blocks it, not that the range was too small. UDP scans a curated service-port list (set UDP_PORTS).
+#  Speed: the TCP scan runs in two phases - a fast sweep for open ports, then service + crypto
+#    enumeration on the open ports only. A progress line prints every PROGRESS_EVERY seconds (default 15).
+#    Timing is adaptive by default (nmap backs off on packet loss - safe on fragile / IPS-protected paths).
+#    Fragile / IPS path (host goes unreachable when the scan starts): go gentle, e.g.
+#        NMAP_TIMING=-T2 MAXRATE=100 sudo -E bash pqc_scan.sh -R -j 1 -p 22,443,3389,1433,3306,5432 -i hosts
+#    Env: NMAP_TIMING (e.g. -T2), MAXRATE (cap pkts/sec), MINRATE (force a floor = faster on robust nets but
+#    can overwhelm an IPS/fragile path), SWEEP_RETRIES (default 2), PROGRESS_EVERY.
 # =============================================================================================
 
-VERSION="2.2"
-LISTS=(); BASE="."; PORTSPEC="--top-ports 1000"; JOBS=4; TESTSSL=0; UDP=1; TMO=8; ALLURL=0
-usage() { sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
-while getopts "i:o:p:j:tnT:Ah" opt; do
+VERSION="2.4"
+LISTS=(); BASE="."; PORTSPEC="--top-ports 1000"; JOBS=4; TESTSSL=0; UDP=1; TMO=8; ALLURL=0; REACHCHK=1
+FASTPORTS="21,22,23,25,53,80,110,135,139,143,389,443,445,465,587,636,993,995,1433,1521,1830,2049,2375,2376,3268,3269,3306,3389,5432,5433,5900,5985,5986,6379,7001,8000,8008,8080,8081,8443,8888,9000,9090,9200,9443,10000,27017"  # -F fast service set
+usage() { sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+while getopts "i:o:p:j:tnRFT:Ah" opt; do
   case "$opt" in
     i) LISTS+=("$OPTARG") ;; o) BASE="$OPTARG" ;; p) PORTSPEC="-p $OPTARG" ;; j) JOBS="$OPTARG" ;;
-    t) TESTSSL=1 ;; n) UDP=0 ;; T) TMO="$OPTARG" ;; A) ALLURL=1 ;; *) usage ;;
+    t) TESTSSL=1 ;; n) UDP=0 ;; R) REACHCHK=0 ;; F) PORTSPEC="-p $FASTPORTS" ;; T) TMO="$OPTARG" ;; A) ALLURL=1 ;; *) usage ;;
   esac
 done
 [ ${#LISTS[@]} -gt 0 ] || usage
@@ -59,12 +79,23 @@ export OPENSSL_CONF="$TMPD/openssl.cnf"          # OS openssl.cnf must not hide 
 LOG="$TMPD/start.log"
 BAR="=================================================================================================="
 
-log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG" >&2; }
+log() {
+  local m
+  m="[$(date +%H:%M:%S)] $*"
+  echo "$m" >> "$LOG" 2>/dev/null
+  if [ -t 2 ]; then printf '\r\033[K%s\n' "$m" >&2; else echo "$m" >&2; fi
+}
 have() { command -v "$1" >/dev/null 2>&1; }
 
 for t in nmap "$OSSL" curl timeout awk; do have "$t" || { echo "missing required tool: $t"; exit 1; }; done
 ROOT=0; [ "$(id -u)" -eq 0 ] && ROOT=1
-if [ $ROOT -eq 1 ]; then NMAPSCAN="-sS -O --osscan-limit"; else NMAPSCAN="-sT"; fi
+if [ $ROOT -eq 1 ]; then NMAPSCAN="-sS -O --osscan-limit"; PROBESCAN="-sS"; else NMAPSCAN="-sT"; PROBESCAN="-sT"; fi
+NMAPRETRY="${NMAP_RETRIES:-2}"
+# per-host scan cap: a full -p- (all 65535 ports) gets 60m to finish; a focused/top-ports scan is capped at 20m so a rate-limiting host cannot hang. Override with HOST_TIMEOUT.
+if [ "$PORTSPEC" = "-p -" ]; then HOSTTMO="${HOST_TIMEOUT:-60m}"; else HOSTTMO="${HOST_TIMEOUT:-20m}"; fi
+TMG="${NMAP_TIMING:--T4}"   # nmap timing template; NMAP_TIMING=-T2 to go gentle on a fragile / IPS path
+CAP=""; [ -n "$MAXRATE" ] && CAP="--max-rate $MAXRATE"   # cap packets/sec (gentle); no forced min-rate by default
+UDPPORTS="${UDP_PORTS:-53,67,69,123,137,161,162,500,514,520,623,1194,1434,1645,1646,1701,1812,1813,4500,5353}"  # important UDP service ports
 SSHAUDIT=""; have ssh-audit && SSHAUDIT="ssh-audit"
 TESTSSLBIN=""; have testssl && TESTSSLBIN="testssl"; have testssl.sh && TESTSSLBIN="testssl.sh"
 IKESCAN=""; have ike-scan && IKESCAN="ike-scan"
@@ -223,12 +254,38 @@ file_desc() {
     32_*) echo "VNC security types" ;;
     40_*) echo "cleartext / not observable / unknown service" ;;
     50_*) echo "IKE / IPsec VPN proposals (UDP 500)" ;;
+    51_*) echo "UDP services: SNMP, IKE/IPsec, OpenVPN, NTP, RADIUS (nmap -sU)" ;;
     certs) echo "PEM certificate files as sent by the servers" ;;
     *) echo "" ;;
   esac
 }
 
 # ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# reach_check <ip> <detail-file>  ->  echoes "up" or "down" and writes a one-line reason to the file.
+#   Stage 1: fast ICMP + common-TCP probe. Stage 2 (only if stage 1 said down): a slower, higher-
+#   retry probe, so a slow or rate-limited device is not wrongly called down.
+reach_check() {
+  local ip="$1" det="$2" res
+  local P1="-PE -PP -PS21,22,23,25,53,80,110,135,139,143,389,443,445,465,587,636,993,995,1433,1521,3306,3389,5432,5900,5985,5986,8080,8443,9443 -PA80,443,3389"
+  # shellcheck disable=SC2086
+  res=$(nmap -sn -n $P1 --host-timeout "${REACH_T1:-40s}" --max-retries "${REACH_R1:-2}" -oG - "$ip" 2>/dev/null)
+  if grep -q 'Status: Up' <<<"$res"; then
+    echo " Reachability    : reachable (fast ICMP / TCP probe)" > "$det"; echo up; return
+  fi
+  # shellcheck disable=SC2086
+  res=$(nmap -Pn -n $PROBESCAN --top-ports 200 -T3 --open --host-timeout "${REACH_T2:-150s}" --max-retries "${REACH_R2:-4}" -oG - "$ip" 2>/dev/null)
+  if grep -qE '[0-9]+/open/' <<<"$res"; then
+    echo " Reachability    : reachable (answered on a common TCP port during the slower confirm probe)" > "$det"; echo up; return
+  fi
+  {
+    echo " Reachability    : UNREACHABLE - no reply to ICMP or ~200 common TCP ports after retries"
+    echo "   fast probe    : ICMP + 30 common TCP ports, host-timeout ${REACH_T1:-40s}, retries ${REACH_R1:-2}"
+    echo "   confirm probe : top-200 TCP, host-timeout ${REACH_T2:-150s}, retries ${REACH_R2:-4}"
+  } > "$det"
+  echo down
+}
+
 scan_target() {   # <key>  - everything for this target goes into ONE folder
   local key="$1"
   local ip="${TIP[$key]}" names="${NAMES[$key]}" inputs="${SRC[$key]}" urls="${URLS[$key]}" sni="-" portspec extra="${EXTRA[$key]}"
@@ -238,6 +295,9 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
   local D="$LISTDIR/$fname" T="$LISTDIR/$fname/.tmp"; mkdir -p "$D/certs" "$T"
   local S="$T/summary.txt" C="$T/rows.csv"; : > "$S"; : > "$C"
   local started; started=$(date '+%Y-%m-%d %H:%M:%S')
+  date +%s > "$T/started_epoch"
+  phase() { echo "$1" > "$T/phase"; }
+  phase "starting"
   log "start  $key$([ "$key" != "$ip" ] && echo " ($ip)")"
 
   {
@@ -251,28 +311,83 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
     echo " Scan started    : $started"
     echo " Scanner         : $(hostname) | pqc_scan.sh $VERSION | $NMAPVER | $OSSLVER"
     echo " PQC KEX testing : $PQCAP"
-    echo " Port scope      : ${portspec#-p }${extra:+  + ports from input: $extra}"
+    local pshow="${portspec#-p }"; pshow="${pshow/--top-ports /top }"; [ "$pshow" = "-" ] || [ "$pshow" = "-p-" ] && pshow="all 65535 TCP ports"
+    echo " Port scope      : ${pshow}${extra:+  + ports from input: $extra}"
   } > "$T/head.txt"
 
-  # ---- nmap: ports, versions, OS, crypto scripts -> 01_ports_services_nmap.txt -------------------
-  local NM="$T/nmap.txt" NF="$D/01_ports_services_nmap.txt"
-  local ncmd="nmap -Pn $NMAPSCAN -sV --version-light -T4 $portspec --script $NSE --script-timeout 5m --host-timeout 90m -oN <file> $ip"
-  { cat "$T/head.txt"; echo "$BAR"; echo " NMAP - open ports, service versions, OS and crypto scripts (all ports)"; echo "$BAR"; echo "\$ $ncmd"; echo; } > "$NF"
-  # shellcheck disable=SC2086
-  nmap -Pn $NMAPSCAN -sV --version-light -T4 $portspec --script "$NSE" --script-timeout 5m --host-timeout 90m -oN "$NM" "$ip" >/dev/null 2>>"$T/nmap.err"
-  grep -v '^# Nmap' "$NM" >> "$NF" 2>/dev/null
-  if [ -n "$extra" ]; then   # ports named in the input that the main port scope did not already find open
-    local need="" xp
-    for xp in ${extra//,/ }; do grep -qE "^$xp/tcp +open " "$NM" || need="${need:+$need,}$xp"; done
-    if [ -n "$need" ]; then
-      { echo; echo "\$ nmap -Pn $NMAPSCAN -sV --version-light -T4 -p $need --script $NSE -oN <file> $ip   (ports from input)"; } >> "$NF"
-      # shellcheck disable=SC2086
-      nmap -Pn $NMAPSCAN -sV --version-light -T4 -p "$need" --script "$NSE" --script-timeout 5m -oN "$T/nmap2.txt" "$ip" >/dev/null 2>>"$T/nmap.err"
-      grep -v '^# Nmap' "$T/nmap2.txt" >> "$NF" 2>/dev/null
-      grep -E '^[0-9]+/tcp|^\|' "$T/nmap2.txt" >> "$NM" 2>/dev/null
+  # ---- reachability pre-check: skip the heavy scan on hosts that are down / unreachable ----------
+  if [ "$REACHCHK" -eq 1 ]; then
+    phase "reachability check"
+    local rstate; rstate=$(reach_check "$ip" "$T/reach.txt")
+    if [ "$rstate" = down ]; then
+      echo UNREACHABLE > "$T/state.txt"
+      printf '%s\n' "${inputs%%;*}" > "$T/reinput.txt"
+      {
+        cat "$T/head.txt"; echo
+        echo "$BAR"; echo " RESULT: HOST UNREACHABLE / DOWN - cryptographic scan skipped"; echo "$BAR"
+        cat "$T/reach.txt"; echo
+        echo " Listed in unreachable.txt for this list. To force a full scan anyway"
+        echo " (for example a host that only listens on an unusual port), re-run:"
+        echo "     ./pqc_scan.sh -R -i unreachable.txt"
+        echo; echo " Scan finished: $(date '+%Y-%m-%d %H:%M:%S')"
+      } > "$D/00_SUMMARY.txt"
+      rmdir "$D/certs" 2>/dev/null
+      {
+        echo "--------------------------------------------------------------------------------------------------"
+        echo " $key$([ "$key" != "$ip" ] && echo "  (IP $ip)")  |  UNREACHABLE / host down (not scanned)  |  folder: $fname/"
+      } > "$T/line.txt"
+      echo "\"$key\",\"$ip\",\"$names\",\"\",\"\",\"-\",\"UNREACHABLE / host down\",\"\",\"\",\"\",\"\",\"\",\"\",\"U\",\"\",\"\",\"not scanned - no response\",\"$fname/00_SUMMARY.txt\"" > "$C"
+      log "UNREACHABLE $key ($ip) - skipped (host down)"
+      return
     fi
+    echo " Reachability    : reachable (pre-check)" >> "$T/head.txt"
   fi
-  [ -s "$T/nmap.err" ] && { echo "nmap stderr:"; cat "$T/nmap.err"; } >> "$NF"
+
+  # ---- nmap, two phases (fast): 1) sweep for open ports, 2) service+crypto on open ports only -----
+  local NM="$T/nmap.txt" NF="$D/01_ports_services_nmap.txt" DG="$T/disc.gnmap"; : > "$NM"
+  local plabel="${portspec#-p }"; plabel="${plabel/--top-ports /top }"; [ "$plabel" = "-" ] || [ "$plabel" = "-p-" ] && plabel="all 65535 TCP"
+  phase "discovering open ports ($plabel)"
+  { cat "$T/head.txt"; echo "$BAR"; echo " NMAP phase 1 - fast port discovery; phase 2 - service versions + crypto scripts on open ports"; echo "$BAR"; } > "$NF"
+  # phase 1: pure SYN/connect sweep, no version/scripts - fast even when every port is filtered
+  local sweep="-sS"; [ $ROOT -eq 0 ] && sweep="-sT"
+  local rate="$CAP"; [ -n "$MINRATE" ] && [ "$MINRATE" != 0 ] && rate="$rate --min-rate $MINRATE"   # default adaptive (nmap backs off on packet loss - safe on IPS/fragile paths); MINRATE forces speed
+  echo "\$ nmap -Pn $sweep $portspec --max-retries ${SWEEP_RETRIES:-2} $rate $TMG --host-timeout $HOSTTMO -oG <file> $ip   (phase 1: find open ports)" >> "$NF"
+  # run in the background with periodic stats so we can show nmap's own % during a long sweep
+  # shellcheck disable=SC2086
+  nmap -Pn $sweep $portspec --max-retries "${SWEEP_RETRIES:-2}" $rate $TMG --stats-every "${PROGRESS_EVERY:-10}s" --host-timeout "$HOSTTMO" -oG "$DG" "$ip" > "$T/sweep_stats.txt" 2>>"$T/nmap.err" &
+  local spid=$! pc
+  while kill -0 "$spid" 2>/dev/null; do
+    pc=$(grep -oE 'About [0-9.]+% done' "$T/sweep_stats.txt" 2>/dev/null | tail -1)
+    phase "discovering open ports${pc:+ - $pc}"
+    sleep 3
+  done
+  wait "$spid"
+  local OPEN; OPEN=$(awk -F'Ports: ' '/Ports:/{n=split($2,a,",");for(i=1;i<=n;i++){split(a[i],b,"/");if(b[2]~/open/){gsub(/ /,"",b[1]);print b[1]}}}' "$DG" 2>/dev/null | sort -un | paste -sd, -)
+  [ -n "$extra" ] && OPEN="${OPEN:+$OPEN,}$extra"
+  OPEN=$(tr ',' '\n' <<<"$OPEN" | grep -E '^[0-9]+$' | sort -un | paste -sd, -)
+  if [ -z "$OPEN" ]; then
+    echo >> "$NF"; echo "Nmap scan report for $ip" >> "$NF"
+    grep -oE 'Not shown: [0-9]+ [a-z-]+ (tcp )?ports? \([a-z-]+\)|[0-9]+/[a-z]+.*' "$DG" >> "$NF" 2>/dev/null
+    echo "No open TCP ports found in the scanned range." >> "$NF"
+    : > "$T/ports.txt"
+  else
+    # phase 2: version + crypto scripts, only on the open ports (fast)
+    phase "service + crypto scripts on $(tr ',' '\n' <<<"$OPEN" | grep -c .) open port(s): $OPEN"
+    echo "\$ nmap -Pn $NMAPSCAN -sV --version-light $TMG -p $OPEN --max-retries $NMAPRETRY $CAP --script $NSE --script-timeout 5m --host-timeout $HOSTTMO -oN <file> $ip   (phase 2)" >> "$NF"
+    echo >> "$NF"
+    # shellcheck disable=SC2086
+    nmap -Pn $NMAPSCAN -sV --version-light $TMG -p "$OPEN" --max-retries "$NMAPRETRY" $CAP --script "$NSE" --script-timeout 5m --host-timeout "$HOSTTMO" -oN "$NM" "$ip" >/dev/null 2>>"$T/nmap.err"
+    grep -v '^# Nmap' "$NM" >> "$NF" 2>/dev/null
+  fi
+  [ -s "$T/nmap.err" ] && { echo; echo "nmap stderr:"; cat "$T/nmap.err"; } >> "$NF"
+
+  # accuracy retry: open ports were found but the service scan errored out with no parsed results
+  if [ -n "$OPEN" ] && ! grep -qE '^[0-9]+/tcp +open ' "$NM" && [ -s "$T/nmap.err" ]; then
+    { echo; echo "\$ retry (slower, more retries) on open ports $OPEN"; } >> "$NF"
+    # shellcheck disable=SC2086
+    nmap -Pn $NMAPSCAN -sV --version-light -T3 -p "$OPEN" --max-retries 4 --script "$NSE" --script-timeout 5m --host-timeout "$HOSTTMO" -oN "$NM" "$ip" >/dev/null 2>>"$T/nmap.err"
+    grep -v '^# Nmap' "$NM" >> "$NF" 2>/dev/null
+  fi
 
   local OSGUESS; OSGUESS=$(grep -m1 -E '^(OS details|Running|Service Info: OS)' "$NM" | sed 's/^[^:]*: *//')
   awk '/^[0-9]+\/tcp +open /{split($1,a,"/"); s=$3; $1=$2=$3=""; sub(/^ +/,""); print a[1]"|"s"|"$0}' "$NM" > "$T/ports.txt"
@@ -280,8 +395,9 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
   local n_enc=0 n_pq=0 n_nt=0 n_d=0 n_clear=0 p svc prod
   while IFS='|' read -r p svc prod <&3; do
     [ -z "$p" ] && continue
+    phase "crypto checks: port $p ($svc)"
     local blk; blk=$(nse_block "$p" "$NM")
-    local base="${svc#ssl/}"; base="${base%\?}"; local st="" layer="" protos="" pqc="n/a" groups="" certtxt="" cls="" flags=() o
+    local base="${svc#ssl/}"; base="${base%\?}"; local st="" layer="" protos="" pqc="n/a" groups="" certtxt="" ciphers="" macs="" cls="" flags=() o
     local tlsok=0 wrapped=0 o_direct=""
     local PB="$T/port.txt" CB="$T/cert.txt" HB="$T/http.txt" TS="$T/testssl.txt"; : > "$PB"; : > "$CB"; : > "$HB"; : > "$TS"
 
@@ -307,6 +423,7 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
         grep -E 'Protocol *:|Cipher is|Temp Key|Negotiated TLS1\.3 group|Peer signature|Peer signing|Verify return|Secure Renegotiation|^ *[0-9]+ s:|^ *i:|^depth' <<<"$o"
       } >> "$PB"
       local dproto dcipher dgroup; dproto=$(hs_proto "$o"); dcipher=$(hs_cipher "$o"); dgroup=$(hs_group "$o")
+      [ -n "$dcipher" ] && ciphers="$dcipher (default negotiated; full list in 10_tls_$p.txt)"
       local verify; verify=$(grep -m1 'Verify return code' <<<"$o" | sed 's/.*code: //')
 
       # certificates -> 11_certificates_<port>.txt + certs/<port>_certN.pem
@@ -472,6 +589,15 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
         kex=$(awk '/kex_algorithms:/{f=1;next} /server_host_key_algorithms:/{f=0} f' <<<"$blk" | sed 's/^|[ _]*//' | grep -v '^$')
         allalg=$(sed 's/^|[ _]*//' <<<"$blk")
       fi
+      if [ -n "$kx" ]; then
+        svc="ssh"; prod=$(grep '^server_identification:' <<<"$kx" | sed 's/^[^:]*: //; s|^SSH-2.0-||; s/_/ /')
+        ciphers=$(grep '^encryption_algorithms_server_to_client:' <<<"$kx" | sed 's/^[^:]*: //; s/,/, /g')
+        macs=$(grep '^mac_algorithms_server_to_client:' <<<"$kx" | sed 's/^[^:]*: //; s/,/, /g')
+      elif [ "$src" = ssh-audit ]; then
+        svc="ssh"; prod=$(grep -m1 '^(gen) software:' <<<"$sa_out" | sed 's/^[^:]*: //')
+        ciphers=$(grep -oE '^\(enc\) [^ ]+' <<<"$sa_out" | awk '{print $2}' | paste -sd, - | sed 's/,/, /g')
+        macs=$(grep -oE '^\(mac\) [^ ]+' <<<"$sa_out" | awk '{print $2}' | paste -sd, - | sed 's/,/, /g')
+      fi
       { echo "--- 1. SSH algorithms offered by the server (source: $src) ---"
         echo "\$ (connect $ip:$p, send identification string, read SSH_MSG_KEXINIT - RFC 4253 s7.1; no key exchange, no login)"
         echo "${kx:-    (scanner could not read KEXINIT after 4 attempts - algorithms taken from $src)}"; } >> "$PB"
@@ -488,6 +614,7 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
         sl=$(grep -xE 'hmac-sha1.*|umac-64.*' <<<"$allalg" | sort -u | paste -sd' ' -)
         [ -n "$sw" ] && flags+=("[Medium] Weak SSH algorithms offered: $sw")
         [ -n "$sl" ] && flags+=("[Low] Legacy SSH MACs offered (SHA-1 / 64-bit tag): $sl")
+        grep -qx 'diffie-hellman-group14-sha256' <<<"$allalg" && flags+=("[Low] SSH offers diffie-hellman-group14-sha256 (2048-bit group, ~112-bit strength) - prefer group16/18 or ML-KEM")
         if ! grep -q 'kex-strict-s' <<<"$allalg" && grep -qE 'chacha20-poly1305|etm@openssh.com' <<<"$allalg"; then
           flags+=("[Medium] Terrapin (CVE-2023-48795) exposure - strict KEX not advertised"); fi
       fi
@@ -582,6 +709,8 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
       echo " Encryption      : $layer"
       echo " Protocols       : ${protos:--}"
       [ -n "$groups" ] && echo " Key exchange    : $groups"
+      [ -n "$ciphers" ] && echo " Ciphers         : $ciphers"
+      [ -n "$macs" ] && echo " MACs            : $macs"
       echo " PQC key exchange: $pqc"
       [ -n "$certtxt" ] && echo " Cert / host key : $certtxt"
       echo " Class           : $cls   (B = weak today, A = quantum-vulnerable, D = post-quantum, U = unknown)"
@@ -598,16 +727,50 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
       printf '  %-9s %-16s %-30s PQC-KEX: %s\n' "$p/tcp" "${svc:0:16}" "${layer:0:30}" "$pqc"
       printf '            Protocols: %s\n' "${protos:--}"
       [ -n "$groups" ] && printf '            Key exchange: %s\n' "$groups"
+      [ -n "$ciphers" ] && printf '            Ciphers: %s\n' "$ciphers"
+      [ -n "$macs" ] && printf '            MACs: %s\n' "$macs"
       [ -n "$certtxt" ] && printf '            Cert/keys: %s\n' "$certtxt"
       printf '            Class: %s    Files: %s%s%s\n' "$cls" "$pf" "$([ -s "$CB" ] && echo ", 11_certificates_$p.txt")" "$([ -s "$HB" ] && echo ", 12_http_$p.txt")"
       print_flags "              " "${flags[@]}"
     } >> "$S"
     local q='"'; esc() { echo "$1" | tr '\n' ';' | sed "s/$q/'/g; s/;$//"; }
-    echo "\"$key\",\"$ip\",\"$names\",\"$p\",\"$svc\",\"$(esc "$prod")\",\"$(esc "$layer")\",\"$(esc "$protos")\",\"$(esc "$pqc")\",\"$(esc "$groups")\",\"$(esc "$certtxt")\",\"$cls\",\"$(grep -c '^\[High\]' <<<"$fl")/$(grep -c '^\[Medium\]' <<<"$fl")\",\"$(esc "$(grep '^\[PQC\]' <<<"$fl")")\",\"$(esc "$(grep -E '^\[(High|Medium|Low)\]' <<<"$fl")")\",\"$fname/$pf\"" >> "$C"
+    echo "\"$key\",\"$ip\",\"$names\",\"$p\",\"$svc\",\"$(esc "$prod")\",\"$(esc "$layer")\",\"$(esc "$protos")\",\"$(esc "$pqc")\",\"$(esc "$groups")\",\"$(esc "$ciphers")\",\"$(esc "$macs")\",\"$(esc "$certtxt")\",\"$cls\",\"$(grep -c '^\[High\]' <<<"$fl")/$(grep -c '^\[Medium\]' <<<"$fl")\",\"$(esc "$(grep '^\[PQC\]' <<<"$fl")")\",\"$(esc "$(grep -E '^\[(High|Medium|Low)\]' <<<"$fl")")\",\"$fname/$pf\"" >> "$C"
   done 3< "$T/ports.txt"
+
+  # ---- UDP service scan (curated important ports) -> 51_udp_services.txt + rows -------------------
+  if [ "$UDP" -eq 1 ] && [ "$ROOT" -eq 1 ]; then
+    phase "UDP service scan"
+    local UNM="$T/udp.txt"
+    # shellcheck disable=SC2086
+    nmap -Pn -sU -sV --version-light -T4 -p "$UDPPORTS" --script "ike-version,snmp-info,ntp-info" --script-timeout 3m --host-timeout "$HOSTTMO" -oN "$UNM" "$ip" >/dev/null 2>>"$T/nmap.err"
+    {
+      cat "$T/head.txt"; echo "$BAR"; echo " NMAP UDP - important service ports ($UDPPORTS)"; echo "$BAR"
+      echo "\$ nmap -Pn -sU -sV -p $UDPPORTS --script ike-version,snmp-info,ntp-info -oN <file> $ip"; echo
+      grep -v '^# Nmap' "$UNM" 2>/dev/null; echo
+      echo "Note: full UDP (all 65535 ports) is not run - it takes hours per host and is unreliable."
+      echo "      Set env UDP_PORTS to scan a different set. IKE detail is in 50_ike_udp500.txt."
+    } > "$D/51_udp_services.txt"
+    local up usvc ulayer upqc ucls uflag
+    while IFS='|' read -r up usvc; do
+      [ -z "$up" ] && continue
+      case "$up" in
+        161|162) ulayer="SNMP (UDP)"; upqc="n/a (symmetric)"; ucls="U"; uflag="[Info] SNMP in use - confirm SNMPv3 with authPriv (AES / SHA); SNMPv1 / v2c have no encryption" ;;
+        500|4500) ulayer="IKE / IPsec VPN (UDP)"; upqc="classical DH unless ML-KEM configured"; ucls="A"; uflag="[PQC] IKE / IPsec key exchange is classical unless ML-KEM (RFC 9370) is configured - see 50_ike_udp500.txt" ;;
+        1194) ulayer="OpenVPN (UDP)"; upqc="TLS-based (not observable here)"; ucls="U"; uflag="[Info] OpenVPN detected - confirm the TLS version and PQC support from the device configuration" ;;
+        1812|1813|1645|1646) ulayer="RADIUS (UDP)"; upqc="n/a"; ucls="U"; uflag="[Info] RADIUS in use - confirm RadSec / IPsec protection; native RADIUS has weak protection" ;;
+        123) ulayer="NTP (UDP)"; upqc="n/a"; ucls="U"; uflag="[Info] NTP in use - unauthenticated time is a resilience risk (not a PQC item)" ;;
+        623) ulayer="IPMI / BMC (UDP)"; upqc="n/a"; ucls="U"; uflag="[Info] IPMI / BMC exposed - confirm it is restricted to the management network" ;;
+        *) ulayer="UDP service ($usvc)"; upqc="not observable"; ucls="U"; uflag="[Info] UDP service $usvc - confirm the encryption in use from the configuration" ;;
+      esac
+      { printf '  %-9s %-16s %-30s PQC-KEX: %s\n' "$up/udp" "${usvc:0:16}" "${ulayer:0:30}" "$upqc"
+        print_flags "              " "$uflag"; } >> "$S"
+      echo "\"$key\",\"$ip\",\"$names\",\"$up/udp\",\"$usvc\",\"\",\"$ulayer\",\"\",\"$upqc\",\"\",\"\",\"\",\"\",\"$ucls\",\"0/0\",\"$(grep -o '^\[PQC\].*' <<<"$uflag")\",\"$uflag\",\"$fname/51_udp_services.txt\"" >> "$C"
+    done < <(awk '/^[0-9]+\/udp +open/ && !/open\|filtered/{split($1,a,"/"); svc=$3; for(i=4;i<=NF;i++) svc=svc" "$i; print a[1]"|"$3}' "$UNM" 2>/dev/null)
+  fi
 
   # ---- IKE / IPsec on UDP 500 -> 50_ike_udp500.txt -------------------------------------------------
   if [ $UDP -eq 1 ] && [ $ROOT -eq 1 ] && [ -n "$IKESCAN" ]; then
+    phase "IKE / IPsec check (UDP 500)"
     local ik1 ik2 sa=""; ik1=$(timeout 30 $IKESCAN -M "$ip" 2>&1); ik2=$(timeout 30 $IKESCAN -2 -M "$ip" 2>&1)
     # a real responder returns a non-zero responder cookie and ONE chosen proposal (a single DH group)
     if grep -qE 'Handshake returned' <<<"$ik1$ik2" && ! grep -q 'CKY-R=0000000000000000' <<<"$ik1$ik2"; then
@@ -651,6 +814,8 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
     cat "$T/head.txt"
     echo " OS (nmap guess) : ${OSGUESS:-not determined$([ $ROOT -eq 0 ] && echo ' (run as root for OS detection)')}"
     echo " Open TCP ports  : $nports"
+    local filt; filt=$(grep -oE 'Not shown: [0-9]+ (filtered|closed|filtered|closed-filtered)' "$NM" 2>/dev/null | head -1)
+    [ -n "$filt" ] && echo " Port note       : $filt (-p- scanned all 65535). If a known service is missing, the path/firewall may be filtering it - confirm scope with the owner."
     echo " PQC READINESS   : $ready"
     echo
     echo "$BAR"
@@ -672,7 +837,9 @@ scan_target() {   # <key>  - everything for this target goes into ONE folder
     echo " PQC READINESS: $ready"
     [ -s "$S" ] && cat "$S"
   } > "$T/line.txt"
-  [ -s "$C" ] || echo "\"$key\",\"$ip\",\"$names\",\"\",\"\",\"\",\"No open TCP ports\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"$fname/00_SUMMARY.txt\"" > "$C"
+  [ -s "$C" ] || echo "\"$key\",\"$ip\",\"$names\",\"\",\"\",\"x\",\"No open TCP ports\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"$fname/00_SUMMARY.txt\"" > "$C"
+  echo "$([ "$nports" -eq 0 ] && echo NOPORTS || echo SCANNED)" > "$T/state.txt"
+  [ -s "$T/nmap.err" ] && echo 1 > "$T/warn"
   log "done   $key - $nports open ports - $ready"
 }
 
@@ -691,6 +858,39 @@ add_target() {
 log "pqc_scan.sh $VERSION | lists: ${LISTS[*]} | parallel $JOBS | root=$ROOT | ports: $PORTSPEC | base folder: $BASE"
 log "openssl: $OSSLVER | PQC KEX testing: $PQCAP | ssh-audit: ${SSHAUDIT:-no} | testssl: ${TESTSSLBIN:-no} | ike-scan: ${IKESCAN:-no} | ssh-keyscan: ${KEYSCAN:-no}"
 [ $ROOT -eq 0 ] && log "not root: TCP connect scan, no OS detection, no UDP/IKE check (run with sudo for those)"
+
+# ---------------------------------------------------------------------------------------------
+# progress_monitor <total> : prints a progress line every PROGRESS_EVERY seconds while a list runs
+progress_monitor() {
+  local total="$1" fin running disc crypto other k d ph start el pct filled i bar line tty=0
+  [ -t 2 ] && tty=1
+  start=$(date +%s)
+  while :; do
+    sleep "${PROGRESS_EVERY:-10}"
+    fin=0; running=0; disc=0; crypto=0; other=0
+    for k in "${KEYS[@]}"; do
+      d="$LISTDIR/$(safe_name "$k")/.tmp"
+      if [ -f "$d/state.txt" ]; then fin=$((fin + 1))
+      elif [ -f "$d/phase" ]; then
+        running=$((running + 1)); ph=$(cat "$d/phase" 2>/dev/null)
+        case "$ph" in discover*|reach*|start*) disc=$((disc + 1)) ;; crypto*|service*) crypto=$((crypto + 1)) ;; *) other=$((other + 1)) ;; esac
+      fi
+    done
+    el=$(( $(date +%s) - start )); pct=$(( total > 0 ? fin * 100 / total : 100 )); filled=$(( fin * 30 / (total > 0 ? total : 1) ))
+    local now=""
+    for k in "${KEYS[@]}"; do
+      d="$LISTDIR/$(safe_name "$k")/.tmp"
+      [ ! -f "$d/state.txt" ] && [ -f "$d/phase" ] && { now="$k: $(cat "$d/phase" 2>/dev/null)"; break; }
+    done
+    bar=""; for ((i = 0; i < 30; i++)); do [ "$i" -lt "$filled" ] && bar+="#" || bar+="-"; done
+    line=$(printf '[%s] %d/%d (%d%%)  running %d (scan %d, crypto %d)  elapsed %d:%02d%s' \
+      "$bar" "$fin" "$total" "$pct" "$running" "$((disc + other))" "$crypto" "$((el / 60))" "$((el % 60))" "${now:+  | $now}")
+    if [ $tty -eq 1 ]; then printf '\r\033[K%s' "$line" >&2
+    else echo "[$(date +%H:%M:%S)] progress: $line" >> "$LOG" 2>/dev/null; fi
+    [ "$fin" -ge "$total" ] && break
+  done
+  [ $tty -eq 1 ] && printf '\r\033[K' >&2
+}
 
 for LISTFILE in "${LISTS[@]}"; do
   LISTNAME=$(basename "$LISTFILE"); LISTNAME=$(safe_name "${LISTNAME%.*}")
@@ -732,17 +932,43 @@ for LISTFILE in "${LISTS[@]}"; do
   done 4< "$LISTFILE"
 
   log "$LISTNAME: ${#KEYS[@]} targets (${#UNRES[@]} not resolved)"
+  pids=(); progress_monitor "${#KEYS[@]}" & MONPID=$!
   for key in "${KEYS[@]}"; do
-    scan_target "$key" &
-    while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
+    scan_target "$key" & pids+=("$!")
+    while [ "$(jobs -rp | grep -vFx "$MONPID" | wc -l)" -ge "$JOBS" ]; do wait -n; done
   done
-  wait
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+  kill "$MONPID" 2>/dev/null; wait "$MONPID" 2>/dev/null
+  [ -t 2 ] && printf '\r\033[K' >&2
+
+  # ---- run accounting: classify every target, build unreachable.txt / not_resolved.txt ----------
+  n_scanned=0; n_noport=0; n_unreach=0; n_warn=0; : > "$LISTDIR/unreachable.txt"
+  for key in "${KEYS[@]}"; do
+    kd="$LISTDIR/$(safe_name "$key")/.tmp"
+    [ -f "$kd/warn" ] && n_warn=$((n_warn + 1))
+    case "$(cat "$kd/state.txt" 2>/dev/null)" in
+      UNREACHABLE) n_unreach=$((n_unreach + 1)); cat "$kd/reinput.txt" >> "$LISTDIR/unreachable.txt" 2>/dev/null ;;
+      NOPORTS)     n_noport=$((n_noport + 1)) ;;
+      *)           n_scanned=$((n_scanned + 1)) ;;
+    esac
+  done
+  [ -s "$LISTDIR/unreachable.txt" ] || rm -f "$LISTDIR/unreachable.txt"
+  [ ${#UNRES[@]} -gt 0 ] && printf '%s\n' "${UNRES[@]}" > "$LISTDIR/not_resolved.txt"
 
   {
     echo "$BAR"
     echo " PQC SCAN SUMMARY - list: $LISTNAME  |  $(date '+%Y-%m-%d %H:%M')  |  ${#KEYS[@]} targets (one folder each)  |  input: $LISTFILE"
     echo " Scanner: $(hostname) | $NMAPVER | $OSSLVER | PQC KEX testing: $PQCAP"
     echo " Class: B = weak today, A = quantum-vulnerable (rate with Mosca), D = post-quantum, U = unknown"
+    echo "$BAR"
+    echo " RUN REPORT - every target accounted for:"
+    echo "   Targets in list          : $(( ${#KEYS[@]} + ${#UNRES[@]} ))"
+    echo "   Reachable & scanned      : $n_scanned"
+    echo "   Reachable, no open ports : $n_noport"
+    echo "   Unreachable / host down  : $n_unreach$([ "$n_unreach" -gt 0 ] && echo "   -> unreachable.txt  (re-run: ./pqc_scan.sh -R -i unreachable.txt)")"
+    echo "   Name not resolved        : ${#UNRES[@]}$([ ${#UNRES[@]} -gt 0 ] && echo "   -> not_resolved.txt")"
+    [ "$n_warn" -gt 0 ] && echo "   Scans with nmap warnings : $n_warn   (see 01_ports_services_nmap.txt in those folders)"
+    echo "   Accounted for            : $(( n_scanned + n_noport + n_unreach + ${#UNRES[@]} )) of $(( ${#KEYS[@]} + ${#UNRES[@]} ))"
     echo "$BAR"
     [ -f "$LISTDIR/ranges.txt" ] && { echo " Ranges (only live hosts scanned):"; sed 's/^/   /' "$LISTDIR/ranges.txt"; }
     for key in "${KEYS[@]}"; do cat "$LISTDIR/$(safe_name "$key")/.tmp/line.txt" 2>/dev/null; done
@@ -752,9 +978,9 @@ for LISTFILE in "${LISTS[@]}"; do
     fi
   } > "$LISTDIR/00_LIST_SUMMARY.txt"
   {
-    echo '"Target","IP","Hostname(s)","Port","Service","Product/Version","Encryption","Protocols","PQC Key Exchange","Key Exchange Groups/KEX","Certificate/Host Keys","Class","High/Medium count","PQC issues","Weaknesses","Evidence file"'
+    echo '"Target","IP","Hostname(s)","Port","Service","Product/Version","Encryption","Protocols","PQC Key Exchange","Key Exchange Groups/KEX","Ciphers","MACs","Certificate/Host Keys","Class","High/Medium count","PQC issues","Weaknesses","Evidence file"'
     for key in "${KEYS[@]}"; do cat "$LISTDIR/$(safe_name "$key")/.tmp/rows.csv" 2>/dev/null; done
-    for u in "${UNRES[@]}"; do echo "\"$u\",\"\",\"\",\"\",\"\",\"\",\"Not scanned - name not resolved\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\""; done
+    for u in "${UNRES[@]}"; do echo "\"$u\",\"\",\"\",\"\",\"\",\"\",\"Not scanned - name not resolved\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\",\"\""; done
   } > "$LISTDIR/summary.csv"
   for key in "${KEYS[@]}"; do rm -rf "$LISTDIR/$(safe_name "$key")/.tmp"; done
   log "finished list $LISTNAME - ${#KEYS[@]} target folders in $LISTDIR"
